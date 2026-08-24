@@ -1,5 +1,6 @@
 # ComfyUI for Intel Arc Pro B70
 
+
 [繁體中文](README_zh-tw.md)
 
 This is a standard, self-contained ComfyUI source checkout configured for Intel Arc XPU. It does **not** require ASUS UGen Console, a vendor runtime, or a fixed installation path. Clone it anywhere, create a local Python virtual environment, and run ComfyUI normally.
@@ -180,3 +181,10 @@ See the [official ComfyUI installation guide](https://github.com/Comfy-Org/Comfy
 ## Upstream and license
 
 This project is based on [ComfyUI](https://github.com/Comfy-Org/ComfyUI). ComfyUI and downloaded models remain subject to their respective licenses. Model weights and generated datasets are not included.
+
+
+
+
+
+
+<sub>Author: Warren Chu</sub>
