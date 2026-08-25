@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential, resumable Z-Image Turbo generation through the ComfyUI HTTP API."""
+"""Run a local ComfyUI workflow repeatedly with prompts from a text file."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import copy
 import csv
 import json
-import random
 import statistics
 import time
 import urllib.error
@@ -23,13 +22,52 @@ CSV_FIELDS = [
 ]
 
 
+class HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    """Preserve example line breaks while still displaying default values."""
+
+
+class ComfyRequestError(RuntimeError):
+    """A rejected local ComfyUI request, including workflow validation details."""
+
+
+def format_api_error(error: urllib.error.HTTPError, raw: str) -> str:
+    try:
+        response = json.loads(raw)
+    except ValueError:
+        response = None
+
+    details: list[str] = []
+    if isinstance(response, dict):
+        api_error = response.get("error", {})
+        if isinstance(api_error, dict):
+            message = api_error.get("message") or api_error.get("type")
+            if message:
+                details.append(str(message))
+        for node_id, node_error in response.get("node_errors", {}).items():
+            class_type = node_error.get("class_type", "unknown node")
+            for item in node_error.get("errors", []):
+                message = item.get("details") or item.get("message") or item.get("type")
+                details.append(f"node {node_id} ({class_type}): {message}")
+    if not details and raw.strip():
+        details.append(raw.strip())
+    suffix = "; ".join(details) if details else error.reason
+    return f"ComfyUI workflow request failed (HTTP {error.code}): {suffix}"
+
+
 def request_json(url: str, method: str = "GET", payload: dict | None = None) -> dict:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method)
     if body is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise ComfyRequestError(format_api_error(exc, raw)) from exc
 
 
 def require_device(stats: dict, expected: str) -> str:
@@ -108,35 +146,140 @@ def history_error(history: dict) -> str:
     return json.dumps(messages[-1], ensure_ascii=False) if messages else "unknown error"
 
 
-def configure(base: dict, prompt: str, index: int, args: argparse.Namespace, prefix: str) -> dict:
+def node_sort_key(node_id: str) -> tuple[int, int | str]:
+    return (0, int(node_id)) if node_id.isdigit() else (1, node_id)
+
+
+def find_workflow_node(
+    workflow: dict,
+    explicit_id: str,
+    label: str,
+    required_inputs: tuple[str, ...],
+    preferred_types: tuple[str, ...],
+    preferred_value: tuple[str, str] | None = None,
+) -> str:
+    if explicit_id:
+        node = workflow.get(explicit_id)
+        if not isinstance(node, dict):
+            raise ValueError(f"{label} node {explicit_id!r} does not exist in the workflow")
+        missing = [name for name in required_inputs if name not in node.get("inputs", {})]
+        if missing:
+            raise ValueError(
+                f"{label} node {explicit_id!r} is missing input(s): {', '.join(missing)}"
+            )
+        return explicit_id
+
+    candidates = [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict)
+        and all(name in node.get("inputs", {}) for name in required_inputs)
+    ]
+    if preferred_value:
+        name, value = preferred_value
+        matches = [
+            node_id for node_id in candidates
+            if workflow[node_id].get("inputs", {}).get(name) == value
+        ]
+        if matches:
+            candidates = matches
+    type_matches = [
+        node_id for node_id in candidates
+        if workflow[node_id].get("class_type") in preferred_types
+    ]
+    if type_matches:
+        candidates = type_matches
+    if not candidates:
+        inputs = ", ".join(required_inputs)
+        raise ValueError(
+            f"Could not auto-detect the {label} node (required inputs: {inputs}). "
+            f"Pass --{label}-node with the node ID from your workflow JSON."
+        )
+    return sorted(candidates, key=node_sort_key)[0]
+
+
+def resolve_workflow_nodes(workflow: dict, args: argparse.Namespace) -> dict[str, str]:
+    if not isinstance(workflow, dict) or not workflow:
+        raise ValueError("Workflow JSON must be a non-empty object keyed by node IDs")
+    return {
+        "prompt": find_workflow_node(
+            workflow, args.prompt_node, "prompt", ("text",),
+            ("CLIPTextEncode",), ("text", "PROMPT_PLACEHOLDER"),
+        ),
+        "size": find_workflow_node(
+            workflow, args.size_node, "size", ("width", "height"),
+            ("EmptySD3LatentImage", "EmptyLatentImage"),
+        ),
+        "sampler": find_workflow_node(
+            workflow, args.sampler_node, "sampler", ("seed", "steps"), ("KSampler",),
+        ),
+        "save": find_workflow_node(
+            workflow, args.save_node, "save", ("filename_prefix",), ("SaveImage",),
+        ),
+    }
+
+
+def configure(
+    base: dict,
+    nodes: dict[str, str],
+    prompt: str,
+    index: int,
+    args: argparse.Namespace,
+    prefix: str,
+) -> dict:
     workflow = copy.deepcopy(base)
-    workflow["4"]["inputs"]["text"] = prompt
-    workflow["6"]["inputs"].update(width=args.width, height=args.height, batch_size=1)
-    workflow["8"]["inputs"].update(seed=args.seed_base + index, steps=args.steps)
-    workflow["10"]["inputs"]["filename_prefix"] = prefix
+    workflow[nodes["prompt"]]["inputs"]["text"] = prompt
+    size_inputs = workflow[nodes["size"]]["inputs"]
+    size_inputs.update(width=args.width, height=args.height)
+    if "batch_size" in size_inputs:
+        size_inputs["batch_size"] = 1
+    workflow[nodes["sampler"]]["inputs"].update(
+        seed=args.seed_base + index, steps=args.steps
+    )
+    workflow[nodes["save"]]["inputs"]["filename_prefix"] = prefix
     return workflow
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prompts", type=Path, help="UTF-8 text file, one prompt per line")
-    parser.add_argument("--server", default="http://127.0.0.1:8188")
-    parser.add_argument("--workflow", type=Path, default=HERE / "zimage_turbo_api.json")
-    parser.add_argument("--results", type=Path, default=HERE / "results.csv")
-    parser.add_argument("--output-prefix", default="visual_search")
-    parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--steps", type=int, default=8)
-    parser.add_argument("--seed-base", type=int, default=700000)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--limit", type=int, default=0, help="0 means all prompts")
-    parser.add_argument("--poll-seconds", type=float, default=0.2)
-    parser.add_argument("--retries", type=int, default=2)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=HelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  batch_generate.py prompts_10000.txt --warmup 3\n"
+            "  batch_generate.py prompts.txt --limit 10 --width 768 --height 768\n"
+            "  batch_generate.py prompts.txt --workflow my_workflow.json\n"
+            "  batch_generate.py prompts.txt --workflow my_workflow.json --prompt-node 12"
+        ),
+    )
+    parser.add_argument("prompts", type=Path, help="UTF-8 text file containing one prompt per line")
+    parser.add_argument(
+        "--server", default="http://127.0.0.1:8188",
+        help="address of the locally running ComfyUI instance",
+    )
+    parser.add_argument(
+        "--workflow", type=Path, default=HERE / "zimage_turbo_workflow.json",
+        help="local executable workflow JSON; edit model loader values to use other models",
+    )
+    parser.add_argument("--results", type=Path, default=HERE / "results.csv", help="resumable CSV results file")
+    parser.add_argument("--output-prefix", default="visual_search", help="subfolder/prefix under ComfyUI output")
+    parser.add_argument("--width", type=int, default=1024, help="generated image width")
+    parser.add_argument("--height", type=int, default=1024, help="generated image height")
+    parser.add_argument("--steps", type=int, default=8, help="sampling steps")
+    parser.add_argument("--seed-base", type=int, default=700000, help="seed for item 0; item index is added")
+    parser.add_argument("--warmup", type=int, default=3, help="warm-up images excluded from results")
+    parser.add_argument("--limit", type=int, default=0, help="maximum prompts to process; 0 means all")
+    parser.add_argument("--poll-seconds", type=float, default=0.2, help="history polling interval")
+    parser.add_argument("--retries", type=int, default=2, help="retries after the first attempt")
     parser.add_argument(
         "--require-device",
         default="",
-        help="Refuse to queue images unless /system_stats contains this device name",
+        help="refuse to run unless the local ComfyUI device name contains this text",
     )
+    parser.add_argument("--prompt-node", default="", metavar="ID", help="node whose text input receives each prompt; auto-detected when omitted")
+    parser.add_argument("--size-node", default="", metavar="ID", help="node whose width/height inputs are updated; auto-detected when omitted")
+    parser.add_argument("--sampler-node", default="", metavar="ID", help="node whose seed/steps inputs are updated; auto-detected when omitted")
+    parser.add_argument("--save-node", default="", metavar="ID", help="node whose filename_prefix is updated; auto-detected when omitted")
     args = parser.parse_args()
 
     args.server = args.server.rstrip("/")
@@ -151,6 +294,11 @@ def main() -> int:
         parser.exit(2, f"ERROR: Workflow file not found: {args.workflow}\n")
     except (OSError, ValueError) as exc:
         parser.exit(2, f"ERROR: Could not load workflow {args.workflow}: {exc}\n")
+
+    try:
+        nodes = resolve_workflow_nodes(base, args)
+    except ValueError as exc:
+        parser.exit(2, f"ERROR: Invalid workflow: {exc}\n")
 
     try:
         stats = request_json(f"{args.server}/system_stats")
@@ -176,7 +324,7 @@ def main() -> int:
     if not done and args.warmup:
         print(f"Warm-up: {args.warmup} images (excluded from results)")
         for n in range(args.warmup):
-            workflow = configure(base, prompts[n % len(prompts)], n, args, "benchmark_warmup/warmup")
+            workflow = configure(base, nodes, prompts[n % len(prompts)], n, args, "benchmark_warmup/warmup")
             _, history, elapsed = queue_and_wait(args.server, workflow, args.poll_seconds)
             if not is_success(history):
                 raise RuntimeError(f"Warm-up failed: {history_error(history)}")
@@ -190,7 +338,7 @@ def main() -> int:
         last_error = ""
         for attempt in range(args.retries + 1):
             try:
-                workflow = configure(base, prompt, index, args, prefix)
+                workflow = configure(base, nodes, prompt, index, args, prefix)
                 prompt_id, history, elapsed = queue_and_wait(args.server, workflow, args.poll_seconds)
                 if not is_success(history):
                     raise RuntimeError(history_error(history))

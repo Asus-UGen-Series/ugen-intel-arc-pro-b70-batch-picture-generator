@@ -12,6 +12,25 @@ $VenvRoot = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
 $Requirements = Join-Path $ProjectRoot "requirements.txt"
 
+function Assert-WindowsPathCapacity {
+    $LongPathsEnabled = Get-ItemPropertyValue `
+        -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+        -Name "LongPathsEnabled" `
+        -ErrorAction SilentlyContinue
+
+    if ($LongPathsEnabled -eq 1) {
+        return
+    }
+
+    # PyTorch 2.13 XPU includes this deeply nested license directory. Legacy
+    # Win32 directory creation can fail at roughly 248 characters.
+    $TorchDeepPath = "Lib\site-packages\torch-2.13.0+xpu.dist-info\licenses\third_party\kineto\libkineto\third_party\dynolog\third_party\prometheus-cpp\3rdparty\civetweb\src\third_party\duktape-1.5.2"
+    $ProjectedPath = Join-Path $VenvRoot $TorchDeepPath
+    if ($ProjectedPath.Length -ge 248) {
+        throw "Windows long-path support is disabled and this repository path is too deep for PyTorch XPU ($($ProjectedPath.Length) characters). Move or clone the repository to a short path such as C:\ComfyUIBatch, then run .\start_comfyui.ps1 again. Alternatively, enable Win32 long paths as Administrator and restart Windows; see README.md."
+    }
+}
+
 function Invoke-CheckedCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -29,6 +48,30 @@ function Invoke-CheckedCommand {
     }
 }
 
+function Test-TorchInstallation {
+    param(
+        [switch]$RequireXpu
+    )
+
+    $RequireXpuPython = if ($RequireXpu) { "True" } else { "False" }
+    $Check = @"
+import importlib.metadata
+import torch
+import torchgen
+import torchaudio
+import torchvision
+
+version = importlib.metadata.version("torch")
+if not version:
+    raise RuntimeError("PyTorch package metadata has no version")
+if $RequireXpuPython and not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+    raise RuntimeError("Intel XPU is not available")
+"@
+
+    & $VenvPython -c $Check 2>$null
+    return $LASTEXITCODE -eq 0
+}
+
 try {
     if ($env:OS -ne "Windows_NT") {
         throw "This setup script supports Windows only."
@@ -36,6 +79,8 @@ try {
     if (-not (Test-Path -LiteralPath $Requirements -PathType Leaf)) {
         throw "requirements.txt was not found in $ProjectRoot."
     }
+
+    Assert-WindowsPathCapacity
 
     $PythonCommand = Get-Command -Name $Python -ErrorAction SilentlyContinue
     if ($null -eq $PythonCommand) {
@@ -73,17 +118,38 @@ try {
     }
     $TorchArguments += @("torch", "torchvision", "torchaudio", "--index-url", $TorchIndex)
 
+    # A cancelled or path-truncated pip run can leave a torch directory and
+    # dist-info behind while omitting torchgen or METADATA. In that state pip
+    # reports "requirement already satisfied" and never repairs it unless the
+    # damaged installation metadata is bypassed explicitly.
+    & $VenvPython -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torch') else 1)" 2>$null
+    $TorchFilesExist = $LASTEXITCODE -eq 0
+    if ($TorchFilesExist -and -not (Test-TorchInstallation)) {
+        Write-Host "The existing PyTorch installation is incomplete; repairing it..." -ForegroundColor Yellow
+        # --ignore-installed is intentional: an interrupted install may have no
+        # valid METADATA or RECORD, so pip cannot reliably uninstall it first.
+        $TorchArguments = @("-m", "pip", "install", "--ignore-installed", "--no-cache-dir") + $TorchArguments[3..($TorchArguments.Count - 1)]
+    }
+
     Write-Host "Installing PyTorch XPU from $TorchIndex..."
     Invoke-CheckedCommand -FilePath $VenvPython -ArgumentList $TorchArguments -Description "PyTorch XPU installation"
 
+    if (-not (Test-TorchInstallation)) {
+        throw "PyTorch installation is incomplete (torch, torchgen, torchvision, torchaudio, or package metadata could not be loaded). Run this script again to force a clean package reinstall."
+    }
+
     Write-Host "Installing ComfyUI dependencies..."
     Invoke-CheckedCommand -FilePath $VenvPython -ArgumentList @("-m", "pip", "install", "-r", $Requirements) -Description "ComfyUI dependency installation"
+    Invoke-CheckedCommand -FilePath $VenvPython -ArgumentList @("-m", "pip", "check") -Description "Python dependency compatibility check"
 
     Write-Host "Checking Intel XPU availability..."
+    if (-not (Test-TorchInstallation -RequireXpu)) {
+        throw "Intel XPU verification failed. PyTorch and its companion packages must import successfully, and torch.xpu.is_available() must return true."
+    }
     Invoke-CheckedCommand -FilePath $VenvPython -ArgumentList @(
         "-c",
-        "import torch; ok = hasattr(torch, 'xpu') and torch.xpu.is_available(); print('PyTorch:', torch.__version__); print('XPU available:', ok); print('Device:', torch.xpu.get_device_name(0) if ok else 'not detected'); raise SystemExit(0 if ok else 1)"
-    ) -Description "Intel XPU verification"
+        "import torch; print('PyTorch:', torch.__version__); print('XPU available:', True); print('Device:', torch.xpu.get_device_name(0))"
+    ) -Description "Intel XPU device report"
 
     Write-Host "Setup complete." -ForegroundColor Green
     Write-Host "Start ComfyUI with: .\start_comfyui.ps1"

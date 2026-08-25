@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential, resumable Z-Image Turbo generation through the ComfyUI HTTP API."""
+"""Run a local ComfyUI workflow repeatedly and record generation performance."""
 
 from __future__ import annotations
 
@@ -23,13 +23,45 @@ CSV_FIELDS = [
 ]
 
 
+class ComfyRequestError(RuntimeError):
+    """A rejected local ComfyUI request, including workflow validation details."""
+
+
+def format_api_error(error: urllib.error.HTTPError, raw: str) -> str:
+    try:
+        response = json.loads(raw)
+    except ValueError:
+        response = None
+
+    details: list[str] = []
+    if isinstance(response, dict):
+        api_error = response.get("error", {})
+        if isinstance(api_error, dict):
+            message = api_error.get("message") or api_error.get("type")
+            if message:
+                details.append(str(message))
+        for node_id, node_error in response.get("node_errors", {}).items():
+            class_type = node_error.get("class_type", "unknown node")
+            for item in node_error.get("errors", []):
+                message = item.get("details") or item.get("message") or item.get("type")
+                details.append(f"node {node_id} ({class_type}): {message}")
+    if not details and raw.strip():
+        details.append(raw.strip())
+    suffix = "; ".join(details) if details else error.reason
+    return f"ComfyUI workflow request failed (HTTP {error.code}): {suffix}"
+
+
 def request_json(url: str, method: str = "GET", payload: dict | None = None) -> dict:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method)
     if body is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise ComfyRequestError(format_api_error(exc, raw)) from exc
 
 
 def require_device(stats: dict, expected: str) -> str:
@@ -121,7 +153,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompts", type=Path, help="UTF-8 text file, one prompt per line")
     parser.add_argument("--server", default="http://127.0.0.1:8188")
-    parser.add_argument("--workflow", type=Path, default=HERE / "zimage_turbo_api.json")
+    parser.add_argument("--workflow", type=Path, default=HERE / "zimage_turbo_workflow.json")
     parser.add_argument("--results", type=Path, default=HERE / "results.csv")
     parser.add_argument("--output-prefix", default="visual_search")
     parser.add_argument("--width", type=int, default=1024)

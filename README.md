@@ -65,6 +65,8 @@ Prerequisites:
 - Git
 - 64-bit Python 3.10-3.14 available as `python`
 
+Keep the cloned repository path short on Windows, for example `C:\ComfyUIBatch`. PyTorch XPU contains deeply nested files, so installation can fail with `WinError 206` when the repository is under a long path and Win32 long-path support is disabled. The setup script checks this before downloading large packages.
+
 Clone your GitHub repository, open PowerShell in the cloned folder, and run:
 
 ```powershell
@@ -75,6 +77,15 @@ Set-ExecutionPolicy -Scope Process Bypass
 On the first run, `start_comfyui.ps1` automatically calls `setup_windows_xpu.ps1`, creates `.venv` inside the clone, installs the official PyTorch XPU wheels and `requirements.txt`, verifies that Intel XPU is available, and then starts ComfyUI. This can take several minutes and requires internet access. Later runs reuse the existing environment. To select another Python installation, use `.\start_comfyui.ps1 -Python C:\path\to\python.exe`.
 
 You may run `.\setup_windows_xpu.ps1` separately when you only want to install or repair the environment.
+
+If you need to keep the repository in a long path, open PowerShell **as Administrator**, enable Win32 long paths, and restart Windows before retrying:
+
+```powershell
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+  -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
+```
+
+An interrupted installation can normally be repaired by running `.\start_comfyui.ps1` again after shortening the path or enabling long paths.
 
 Open <http://127.0.0.1:8188> after ComfyUI starts.
 

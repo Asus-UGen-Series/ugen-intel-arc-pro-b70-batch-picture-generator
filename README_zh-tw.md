@@ -64,6 +64,8 @@ Windows WDDM 2 之後可以在韌體初始化完成後，重新協商支援此�
 - Git
 - 可用 `python` 指令啟動的 64-bit Python 3.10-3.14
 
+Windows 上請把 repository clone 到較短的路徑，例如 `C:\ComfyUIBatch`。PyTorch XPU 內含非常深的目錄；如果 repository 路徑太長且 Windows 尚未啟用 Win32 長路徑，安裝可能出現 `WinError 206`。安裝腳本會在下載大型套件之前先檢查這個問題。
+
 Clone 你的 GitHub repository，在 clone 後的資料夾開啟 PowerShell：
 
 ```powershell
@@ -74,6 +76,15 @@ Set-ExecutionPolicy -Scope Process Bypass
 第一次執行時，`start_comfyui.ps1` 會自動呼叫 `setup_windows_xpu.ps1`，在專案內建立 `.venv`、安裝官方 PyTorch XPU 與 `requirements.txt`、確認 Intel XPU 可用，然後啟動 ComfyUI。首次安裝可能需要數分鐘且必須能連線網路；之後會直接重用現有環境。若要指定其他 Python，請使用 `.\start_comfyui.ps1 -Python C:\path\to\python.exe`。
 
 如果只想安裝或修復環境，也可以另外執行 `.\setup_windows_xpu.ps1`。
+
+如果必須保留較長的 repository 路徑，請以**系統管理員身分**開啟 PowerShell，執行以下指令開啟 Win32 長路徑，重新啟動 Windows 後再試：
+
+```powershell
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+  -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
+```
+
+若先前安裝曾經中斷，縮短路徑或啟用長路徑後，通常直接重新執行 `.\start_comfyui.ps1` 即可修復未完成的 `.venv`。
 
 ComfyUI 啟動後開啟 <http://127.0.0.1:8188>。
 

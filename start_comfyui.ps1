@@ -19,7 +19,7 @@ function Test-ComfyEnvironment {
         return $false
     }
     try {
-        & $VenvPython -c "import aiohttp, torch; raise SystemExit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() else 1)" 2>$null
+        & $VenvPython -c "import importlib.metadata, aiohttp, torch, torchgen, torchaudio, torchvision; assert importlib.metadata.version('torch'); raise SystemExit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() else 1)" 2>$null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -43,7 +43,10 @@ try {
         }
         & $SetupScript @SetupArguments
         if (-not (Test-ComfyEnvironment)) {
-            throw "Automatic setup did not produce a working Intel XPU environment. Review the SETUP FAILED message above."
+            Write-Host ""
+            Write-Host "ComfyUI was not started because first-time setup is incomplete." -ForegroundColor Yellow
+            Write-Host "Fix the SETUP FAILED message above, then run .\start_comfyui.ps1 again."
+            return
         }
     }
 
