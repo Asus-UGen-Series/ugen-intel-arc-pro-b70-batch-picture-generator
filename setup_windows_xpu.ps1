@@ -48,28 +48,39 @@ function Invoke-CheckedCommand {
     }
 }
 
+function Test-PythonCode {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Code
+    )
+
+    # A nonzero exit is an expected Boolean result for probe commands. Some
+    # PowerShell versions promote native stderr/nonzero exits into terminating
+    # errors when the surrounding script uses ErrorAction=Stop.
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $VenvPython -c $Code 2>$null
+        $CheckExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    return $CheckExitCode -eq 0
+}
+
 function Test-TorchInstallation {
     param(
         [switch]$RequireXpu
     )
 
-    $RequireXpuPython = if ($RequireXpu) { "True" } else { "False" }
-    $Check = @"
-import importlib.metadata
-import torch
-import torchgen
-import torchaudio
-import torchvision
+    $XpuCheck = if ($RequireXpu) {
+        " and hasattr(torch, 'xpu') and torch.xpu.is_available()"
+    } else {
+        ""
+    }
+    $Check = "import importlib.metadata, torch, torchgen, torchaudio, torchvision; version = importlib.metadata.version('torch'); ok = bool(version)$XpuCheck; raise SystemExit(0 if ok else 1)"
 
-version = importlib.metadata.version("torch")
-if not version:
-    raise RuntimeError("PyTorch package metadata has no version")
-if $RequireXpuPython and not (hasattr(torch, "xpu") and torch.xpu.is_available()):
-    raise RuntimeError("Intel XPU is not available")
-"@
-
-    & $VenvPython -c $Check 2>$null
-    return $LASTEXITCODE -eq 0
+    return Test-PythonCode -Code $Check
 }
 
 try {
@@ -122,8 +133,7 @@ try {
     # dist-info behind while omitting torchgen or METADATA. In that state pip
     # reports "requirement already satisfied" and never repairs it unless the
     # damaged installation metadata is bypassed explicitly.
-    & $VenvPython -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torch') else 1)" 2>$null
-    $TorchFilesExist = $LASTEXITCODE -eq 0
+    $TorchFilesExist = Test-PythonCode -Code "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torch') else 1)"
     if ($TorchFilesExist -and -not (Test-TorchInstallation)) {
         Write-Host "The existing PyTorch installation is incomplete; repairing it..." -ForegroundColor Yellow
         # --ignore-installed is intentional: an interrupted install may have no
