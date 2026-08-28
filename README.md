@@ -1,4 +1,4 @@
-# ComfyUI for Intel Arc Pro B70
+# ComfyUI for UGen Intel Arc Pro B70 32G
 
 
 [繁體中文](README_zh-tw.md)
